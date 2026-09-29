@@ -1,5 +1,7 @@
 from fastapi import FastAPI
-from app.routers import leads
+
+from app.routers import gmail
+
 
 app = FastAPI(
     title="LeadPilot",
@@ -8,11 +10,12 @@ app = FastAPI(
 )
 
 
-app.include_router(leads.router)
+app.include_router(gmail.router)
 
 
 @app.get("/")
 def root():
+
     return {
         "message": "LeadPilot API is running"
     }
