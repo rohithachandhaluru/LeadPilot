@@ -8,10 +8,16 @@ from dotenv import load_dotenv
 from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+
 from email.mime.text import MIMEText
 
 
+# --------------------------------------------------
 # Load environment variables
+# --------------------------------------------------
+
 load_dotenv()
 
 
@@ -39,14 +45,67 @@ REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
 
 # --------------------------------------------------
-# Temporary Storage
+# Token Storage
 # --------------------------------------------------
 
-# Stores Gmail credentials after successful OAuth
+# Save token.json in the backend folder
+BASE_DIR = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        ".."
+    )
+)
+
+TOKEN_FILE = os.path.join(
+    BASE_DIR,
+    "token.json"
+)
+
+
+# --------------------------------------------------
+# Temporary OAuth Flow Storage
+# --------------------------------------------------
+
+oauth_flows = {}
+
+
+# --------------------------------------------------
+# Gmail Credentials Storage
+# --------------------------------------------------
+
 credentials_storage = {}
 
-# Stores OAuth Flow objects temporarily
-oauth_flows = {}
+
+# --------------------------------------------------
+# Load previously saved Gmail credentials
+# --------------------------------------------------
+
+def load_saved_credentials():
+
+    if not os.path.exists(TOKEN_FILE):
+        return
+
+    try:
+
+        credentials = Credentials.from_authorized_user_file(
+            TOKEN_FILE,
+            SCOPES
+        )
+
+        credentials_storage["gmail"] = credentials
+
+        print("Saved Gmail credentials loaded.")
+
+    except Exception as e:
+
+        print(
+            f"Could not load saved Gmail credentials: {e}"
+        )
+
+
+# Load credentials when application starts
+load_saved_credentials()
 
 
 # --------------------------------------------------
@@ -96,8 +155,12 @@ def create_flow():
         "web": {
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_uri": (
+                "https://accounts.google.com/o/oauth2/auth"
+            ),
+            "token_uri": (
+                "https://oauth2.googleapis.com/token"
+            ),
             "redirect_uris": [REDIRECT_URI]
         }
     }
@@ -123,12 +186,14 @@ def gmail_login():
 
         flow = create_flow()
 
-        authorization_url, state = flow.authorization_url(
-            access_type="offline",
-            prompt="consent"
+        authorization_url, state = (
+            flow.authorization_url(
+                access_type="offline",
+                prompt="consent"
+            )
         )
 
-        # Store the flow using the OAuth state
+        # Keep flow temporarily for OAuth callback
         oauth_flows[state] = flow
 
         return {
@@ -175,8 +240,23 @@ def gmail_callback(
 
         credentials = flow.credentials
 
-        # Store credentials
+        # Store credentials in memory
         credentials_storage["gmail"] = credentials
+
+        # ------------------------------------------
+        # IMPORTANT:
+        # Save credentials permanently
+        # ------------------------------------------
+
+        with open(
+            TOKEN_FILE,
+            "w",
+            encoding="utf-8"
+        ) as token:
+
+            token.write(
+                credentials.to_json()
+            )
 
         # Remove used OAuth flow
         del oauth_flows[state]
@@ -215,6 +295,52 @@ def get_gmail_service():
 
     credentials = credentials_storage["gmail"]
 
+    # ------------------------------------------
+    # Refresh expired access token
+    # ------------------------------------------
+
+    if credentials.expired:
+
+        if credentials.refresh_token:
+
+            try:
+
+                credentials.refresh(
+                    Request()
+                )
+
+                # Save refreshed credentials
+                with open(
+                    TOKEN_FILE,
+                    "w",
+                    encoding="utf-8"
+                ) as token:
+
+                    token.write(
+                        credentials.to_json()
+                    )
+
+            except Exception as e:
+
+                raise HTTPException(
+                    status_code=401,
+                    detail=(
+                        "Gmail session could not be "
+                        f"refreshed: {str(e)}. "
+                        "Please connect Gmail again."
+                    )
+                )
+
+        else:
+
+            raise HTTPException(
+                status_code=401,
+                detail=(
+                    "Gmail authorization has expired. "
+                    "Please connect Gmail again."
+                )
+            )
+
     return build(
         "gmail",
         "v1",
@@ -235,7 +361,6 @@ def send_email(
 
         gmail_service = get_gmail_service()
 
-        # Create email
         message = MIMEText(
             request.body
         )
@@ -243,16 +368,17 @@ def send_email(
         message["to"] = request.to
         message["subject"] = request.subject
 
-        # Encode email
-        encoded_message = base64.urlsafe_b64encode(
-            message.as_bytes()
-        ).decode()
+        encoded_message = (
+            base64.urlsafe_b64encode(
+                message.as_bytes()
+            )
+            .decode()
+        )
 
         email_body = {
             "raw": encoded_message
         }
 
-        # Send email through Gmail API
         result = (
             gmail_service
             .users()
@@ -299,14 +425,9 @@ def send_batch_emails(
         successful = 0
         failed = 0
 
-        # Process each lead
         for lead in request.recipients:
 
             try:
-
-                # ------------------------------------------
-                # Personalize email
-                # ------------------------------------------
 
                 personalized_body = (
                     request.body
@@ -320,10 +441,6 @@ def send_batch_emails(
                     )
                 )
 
-                # ------------------------------------------
-                # Create email
-                # ------------------------------------------
-
                 message = MIMEText(
                     personalized_body
                 )
@@ -331,21 +448,16 @@ def send_batch_emails(
                 message["to"] = lead.email
                 message["subject"] = request.subject
 
-                # ------------------------------------------
-                # Encode email
-                # ------------------------------------------
-
-                encoded_message = base64.urlsafe_b64encode(
-                    message.as_bytes()
-                ).decode()
+                encoded_message = (
+                    base64.urlsafe_b64encode(
+                        message.as_bytes()
+                    )
+                    .decode()
+                )
 
                 email_body = {
                     "raw": encoded_message
                 }
-
-                # ------------------------------------------
-                # Send email
-                # ------------------------------------------
 
                 result = (
                     gmail_service
@@ -379,10 +491,6 @@ def send_batch_emails(
                     "status": "failed",
                     "error": str(e)
                 })
-
-        # ------------------------------------------
-        # Final response
-        # ------------------------------------------
 
         return {
             "total": len(request.recipients),

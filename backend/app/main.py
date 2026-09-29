@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers import gmail
+from app.routers import gmail, leads
 
 
 app = FastAPI(
@@ -11,6 +11,7 @@ app = FastAPI(
 
 
 app.include_router(gmail.router)
+app.include_router(leads.router)
 
 
 @app.get("/")
