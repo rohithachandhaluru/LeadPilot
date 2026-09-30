@@ -36,7 +36,8 @@ router = APIRouter(
 # --------------------------------------------------
 
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.send"
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly"
 ]
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -501,6 +502,81 @@ def send_batch_emails(
 
     except HTTPException:
 
+        raise
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+# --------------------------------------------------
+# Read Recent Gmail Messages
+# --------------------------------------------------
+
+@router.get("/inbox")
+def get_inbox_messages():
+
+    try:
+        gmail_service = get_gmail_service()
+
+        response = (
+            gmail_service
+            .users()
+            .messages()
+            .list(
+                userId="me",
+                maxResults=10
+            )
+            .execute()
+        )
+
+        messages = response.get("messages", [])
+
+        results = []
+
+        for message in messages:
+
+            message_id = message["id"]
+
+            message_data = (
+                gmail_service
+                .users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="full"
+                )
+                .execute()
+            )
+
+            headers = message_data["payload"].get("headers", [])
+
+            sender = ""
+            subject = ""
+
+            for header in headers:
+
+                if header["name"].lower() == "from":
+                    sender = header["value"]
+
+                elif header["name"].lower() == "subject":
+                    subject = header["value"]
+
+            results.append({
+                "message_id": message_id,
+                "sender": sender,
+                "subject": subject,
+                "snippet": message_data.get("snippet", "")
+            })
+
+        return {
+            "total": len(results),
+            "messages": results
+        }
+
+    except HTTPException:
         raise
 
     except Exception as e:

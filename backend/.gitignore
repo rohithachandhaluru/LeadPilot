@@ -4,3 +4,4 @@ credentials.json
 venv/
 __pycache__/
 .vscode/
+token_backup.json
