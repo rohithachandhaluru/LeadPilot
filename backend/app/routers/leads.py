@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from app.routers.gmail import get_gmail_service
 from database.supabase import supabase
+from services.ai_service import analyze_lead_reply, generate_reply
 
 
 router = APIRouter(
@@ -932,6 +933,119 @@ def extract_plain_text_body(payload):
 
 
 # --------------------------------------------------
+# Retrieve Relevant Knowledge (simple keyword match)
+# --------------------------------------------------
+
+def retrieve_knowledge(query: str) -> str:
+    """
+    Retrieve the most relevant knowledge chunks from Supabase.
+    Uses simple keyword overlap scoring (no vector DB needed).
+    Returns up to 3 most relevant chunks joined as a single string.
+    """
+
+    try:
+
+        # Fetch all chunks
+        response = (
+            supabase
+            .table("knowledge_chunks")
+            .select("content")
+            .execute()
+        )
+
+        chunks = response.data or []
+
+        if not chunks:
+            return ""
+
+        # Score each chunk by keyword overlap with the query
+        query_words = set(
+            re.findall(r"\w+", query.lower())
+        )
+
+        scored = []
+
+        for chunk in chunks:
+
+            content = chunk.get("content", "")
+
+            chunk_words = set(
+                re.findall(r"\w+", content.lower())
+            )
+
+            score = len(
+                query_words & chunk_words
+            )
+
+            scored.append((score, content))
+
+        # Sort by score descending
+        scored.sort(
+            key=lambda x: x[0],
+            reverse=True
+        )
+
+        # Take top 3 chunks with score > 0
+        top_chunks = [
+            content
+            for score, content in scored[:3]
+            if score > 0
+        ]
+
+        return "\n\n".join(top_chunks)
+
+    except Exception:
+        return ""
+
+
+# --------------------------------------------------
+# Send Reply In Same Gmail Thread
+# --------------------------------------------------
+
+def send_thread_reply(
+    gmail_service,
+    to_email: str,
+    subject: str,
+    body: str,
+    thread_id: str
+):
+    """
+    Send a reply in an existing Gmail thread.
+    The subject must be prefixed with Re: to maintain thread.
+    Returns the Gmail API result dict.
+    """
+
+    reply_subject = subject if subject.lower().startswith("re:") else f"Re: {subject}"
+
+    message = MIMEText(body)
+    message["to"] = to_email
+    message["subject"] = reply_subject
+
+    encoded_message = (
+        base64.urlsafe_b64encode(
+            message.as_bytes()
+        )
+        .decode()
+    )
+
+    result = (
+        gmail_service
+        .users()
+        .messages()
+        .send(
+            userId="me",
+            body={
+                "raw": encoded_message,
+                "threadId": thread_id
+            }
+        )
+        .execute()
+    )
+
+    return result
+
+
+# --------------------------------------------------
 # Get Replies From Campaign Leads
 # --------------------------------------------------
 
@@ -1019,6 +1133,29 @@ def get_lead_replies():
         }
 
         # ------------------------------------------
+        # Get campaigns from Supabase
+        # ------------------------------------------
+
+        campaign_ids = list({
+            row["campaign_id"]
+            for row in campaign_leads
+            if row.get("campaign_id") is not None
+        })
+
+        campaigns_response = (
+            supabase
+            .table("campaigns")
+            .select("id,subject,body")
+            .in_("id", campaign_ids)
+            .execute()
+        )
+
+        campaigns_by_id = {
+            c["id"]: c
+            for c in (campaigns_response.data or [])
+        }
+
+        # ------------------------------------------
         # Create thread lookup
         # ------------------------------------------
 
@@ -1042,9 +1179,14 @@ def get_lead_replies():
             if not lead:
                 continue
 
+            campaign = campaigns_by_id.get(
+                campaign_lead["campaign_id"]
+            )
+
             campaign_by_thread[thread_id] = {
                 "campaign_lead": campaign_lead,
-                "lead": lead
+                "lead": lead,
+                "campaign": campaign
             }
 
         # ------------------------------------------
@@ -1121,6 +1263,10 @@ def get_lead_replies():
                 matched_campaign["lead"]
             )
 
+            campaign = (
+                matched_campaign.get("campaign") or {}
+            )
+
             payload = message_data.get(
                 "payload",
                 {}
@@ -1170,7 +1316,7 @@ def get_lead_replies():
             )
 
             # --------------------------------------
-            # Verify sender
+            # Verify sender is the lead
             # --------------------------------------
 
             if sender_email != lead_email:
@@ -1224,7 +1370,18 @@ def get_lead_replies():
                 continue
 
             # --------------------------------------
-            # Save incoming reply
+            # Step 1: Classify intent with Gemini
+            # --------------------------------------
+
+            intent = "unclear"
+
+            try:
+                intent = analyze_lead_reply(clean_body)
+            except Exception as e:
+                print(f"[LeadPilot] Intent classification failed: {e}")
+
+            # --------------------------------------
+            # Step 2: Save incoming reply with intent
             # --------------------------------------
 
             (
@@ -1241,16 +1398,17 @@ def get_lead_replies():
                     ),
                     "direction": "received",
                     "subject": subject,
-                    "body": clean_body
+                    "body": clean_body,
+                    "intent": intent
                 })
                 .execute()
             )
 
             # --------------------------------------
-            # Add API response
+            # Step 3: Build API result entry
             # --------------------------------------
 
-            replies.append({
+            reply_entry = {
                 "message_id": message_id,
                 "thread_id": message_thread_id,
                 "lead_id": lead["id"],
@@ -1261,8 +1419,131 @@ def get_lead_replies():
                 "email": lead["email"],
                 "company": lead["company"],
                 "subject": subject,
-                "reply": clean_body
-            })
+                "reply": clean_body,
+                "intent": intent,
+                "auto_reply_sent": False,
+                "auto_reply_skipped_reason": None
+            }
+
+            # --------------------------------------
+            # Step 4: Skip auto-reply if unsubscribed
+            # --------------------------------------
+
+            if lead.get("unsubscribed"):
+
+                reply_entry["auto_reply_skipped_reason"] = (
+                    "Lead is unsubscribed"
+                )
+
+                replies.append(reply_entry)
+                continue
+
+            # --------------------------------------
+            # Step 5: Retrieve relevant knowledge
+            # --------------------------------------
+
+            knowledge_context = retrieve_knowledge(
+                clean_body
+            )
+
+            # --------------------------------------
+            # Step 6: Generate AI reply
+            # --------------------------------------
+
+            campaign_subject = campaign.get(
+                "subject", ""
+            )
+
+            campaign_body = campaign.get(
+                "body", ""
+            )
+
+            generated_reply = None
+
+            try:
+                generated_reply = generate_reply(
+                    lead_name=lead["name"],
+                    lead_company=lead["company"],
+                    campaign_subject=campaign_subject,
+                    campaign_body=campaign_body,
+                    customer_reply=clean_body,
+                    intent=intent,
+                    knowledge_context=knowledge_context
+                )
+            except Exception as e:
+                print(f"[LeadPilot] Reply generation failed: {e}")
+
+            if not generated_reply:
+
+                reply_entry["auto_reply_skipped_reason"] = (
+                    "AI reply generation failed"
+                )
+
+                replies.append(reply_entry)
+                continue
+
+            # --------------------------------------
+            # Step 7: Send reply in same Gmail thread
+            # --------------------------------------
+
+            sent_result = None
+
+            try:
+                sent_result = send_thread_reply(
+                    gmail_service=gmail_service,
+                    to_email=lead["email"],
+                    subject=campaign_subject,
+                    body=generated_reply,
+                    thread_id=message_thread_id
+                )
+            except Exception as e:
+                print(f"[LeadPilot] Failed to send reply via Gmail: {e}")
+
+            if not sent_result:
+
+                reply_entry["auto_reply_skipped_reason"] = (
+                    "Gmail send failed"
+                )
+
+                replies.append(reply_entry)
+                continue
+
+            # --------------------------------------
+            # Step 8: Store outgoing response
+            # --------------------------------------
+
+            sent_gmail_message_id = sent_result.get("id")
+            sent_gmail_thread_id = sent_result.get("threadId")
+
+            try:
+                (
+                    supabase
+                    .table("email_messages")
+                    .insert({
+                        "lead_id": lead["id"],
+                        "campaign_id": (
+                            campaign_lead["campaign_id"]
+                        ),
+                        "gmail_message_id": sent_gmail_message_id,
+                        "gmail_thread_id": sent_gmail_thread_id,
+                        "direction": "sent",
+                        "subject": f"Re: {campaign_subject}",
+                        "body": generated_reply,
+                        "intent": intent
+                    })
+                    .execute()
+                )
+            except Exception as e:
+                print(f"[LeadPilot] Failed to store outgoing reply: {e}")
+
+            # --------------------------------------
+            # Step 9: Mark auto reply as sent
+            # --------------------------------------
+
+            reply_entry["auto_reply_sent"] = True
+            reply_entry["auto_reply_body"] = generated_reply
+
+            replies.append(reply_entry)
 
         # ------------------------------------------
         # Return
